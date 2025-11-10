@@ -1,0 +1,10 @@
+
+opencv-python
+numpy
+
+# Option A: YOLO (easy, fast to start, auto-downloads models)
+ultralytics
+
+# Option B: EfficientDet via TensorFlow Hub (optional)
+tensorflow
+tensorflow-hub
