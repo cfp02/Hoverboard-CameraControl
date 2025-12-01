@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 LeafBot Vision MVP:
 - Reads RTSP or MJPEG from --source URL
