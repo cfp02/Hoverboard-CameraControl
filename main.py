@@ -1,25 +1,27 @@
 """
-LeafBot Vision MVP:
-- Reads RTSP or MJPEG from --source URL
-- Detects a PERSON with YOLO (default) or EfficientDet
-- Draws a bounding box and overlays simple control signals (ex, ez) for future use
-- Designed to be easily extended into a follow/edge-driving controller
+LeafBot Vision GUI:
+- GUI application with RTSP stream connection
+- Serial communication with ESP32
+- Person detection with YOLO (optional)
+- Real-time video display with detection overlays
 
-Usage examples:
-  python leafbot_detect.py --source "rtsp://user:pass@ip:port/stream"
-  python leafbot_detect.py --source "http://ip:port/mjpg"
-  python leafbot_detect.py --model yolo --model-name yolov8n.pt
-  python leafbot_detect.py --model efficientdet --model-name efficientdet_lite0
-
-Press 'q' to quit.
+Usage:
+  python main.py
 """
 
 import argparse
 import time
+import threading
+import queue
 from typing import Optional, Tuple
+import serial
+import serial.tools.list_ports
 
 import cv2
 import numpy as np
+from PIL import Image, ImageTk
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
 
 # --- Detector Abstractions ----------------------------------------------------
 
@@ -66,80 +68,18 @@ class YoloDetector(BaseDetector):
             dets.append(Detection((x1,y1,x2,y2), conf, cls_name))
         return dets
 
-# ---- EfficientDet via TensorFlow Hub ----------------------------------------
-
-class EfficientDetDetector(BaseDetector):
-    """
-    Uses TF-Hub models like:
-      - 'efficientdet_lite0' (fastest)
-      - 'efficientdet_lite1', 'efficientdet_lite2' (bigger)
-    """
-    def __init__(self, model_name: str = "efficientdet_lite0", conf_thres: float = 0.4):
-        import tensorflow as tf
-        import tensorflow_hub as hub
-
-        # Map simple names to TF-Hub handles
-        handles = {
-            "efficientdet_lite0": "https://tfhub.dev/tensorflow/efficientdet/lite0/detection/1",
-            "efficientdet_lite1": "https://tfhub.dev/tensorflow/efficientdet/lite1/detection/1",
-            "efficientdet_lite2": "https://tfhub.dev/tensorflow/efficientdet/lite2/detection/1",
-        }
-        self.tf = tf
-        self.model = hub.load(handles[model_name])
-        self.conf_thres = conf_thres
-
-        # COCO person class id is 1 for this TF-Hub model outputs (verify in practice)
-        # We'll filter by COCO label map; TF-Hub returns class IDs starting at 1
-        self.person_class_ids = {1}
-
-    def detect(self, frame_bgr: np.ndarray) -> list[Detection]:
-        tf = self.tf
-        # Model expects RGB float32 in [0,1], with batch dim
-        img_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        inp = tf.convert_to_tensor(img_rgb, dtype=tf.uint8)
-        inp = tf.expand_dims(inp, 0)  # [1,H,W,3]
-
-        outputs = self.model(inp)
-        # Outputs: 'detection_boxes' [1,100,4] (ymin,xmin,ymax,xmax) normalized,
-        #          'detection_scores' [1,100], 'detection_classes' [1,100]
-        boxes = outputs["detection_boxes"][0].numpy()
-        scores = outputs["detection_scores"][0].numpy()
-        classes = outputs["detection_classes"][0].numpy().astype(int)
-
-        H, W = frame_bgr.shape[:2]
-        dets: list[Detection] = []
-        for box, score, cls in zip(boxes, scores, classes):
-            if score < self.conf_thres:
-                continue
-            if cls not in self.person_class_ids:
-                continue
-            ymin, xmin, ymax, xmax = box  # normalized
-            x1, y1 = int(xmin * W), int(ymin * H)
-            x2, y2 = int(xmax * W), int(ymax * H)
-            dets.append(Detection((x1, y1, x2, y2), float(score), "person"))
-        return dets
-
 # --- Utility ------------------------------------------------------------------
 
 def pick_target(detections: list[Detection], strategy: str = "largest") -> Optional[Detection]:
-    """
-    Choose one person detection to follow/highlight.
-    - 'largest': pick the bbox with largest area (proxy for closest person)
-    - 'conf': pick highest confidence
-    """
+    """Choose one person detection to follow/highlight."""
     if not detections:
         return None
     if strategy == "conf":
         return max(detections, key=lambda d: d.conf)
-    # default: largest area
     return max(detections, key=lambda d: (d.xyxy[2]-d.xyxy[0])*(d.xyxy[3]-d.xyxy[1]))
 
 def compute_errors(bbox: Tuple[int,int,int,int], W: int, H: int, target_h_frac: float = 0.45) -> Tuple[float,float]:
-    """
-    Compute simple control-friendly errors from a bbox:
-      ex: lateral error in [-1,1] (left negative, right positive)
-      ez: distance error (positive => too far) based on desired bbox height fraction
-    """
+    """Compute control-friendly errors from a bbox."""
     x1, y1, x2, y2 = bbox
     cx = 0.5*(x1 + x2)
     h  = (y2 - y1)
@@ -155,81 +95,513 @@ def draw_bbox(frame: np.ndarray, det: Detection, ex: float, ez: float, fps: floa
     cv2.putText(frame, label, (x1, max(0,y1-8)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 1, cv2.LINE_AA)
     cv2.putText(frame, f"FPS: {fps:.1f}", (8,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
 
+# --- Serial Manager (Compartmentalized) ---------------------------------------
+
+class SerialManager:
+    """Manages serial communication in a thread-safe manner."""
+    def __init__(self, port: str, baudrate: int = 115200):
+        self.port = port
+        self.baudrate = baudrate
+        self.conn = None
+        self.lock = threading.Lock()
+        self.is_connected = False
+        
+    def connect(self) -> bool:
+        """Connect to serial port. Returns True if successful."""
+        with self.lock:
+            if self.is_connected:
+                return True
+            try:
+                self.conn = serial.Serial(self.port, self.baudrate, timeout=1)
+                self.is_connected = True
+                return True
+            except Exception:
+                self.conn = None
+                self.is_connected = False
+                return False
+    
+    def disconnect(self):
+        """Disconnect from serial port."""
+        with self.lock:
+            if self.conn:
+                try:
+                    self.conn.close()
+                except:
+                    pass
+                self.conn = None
+            self.is_connected = False
+    
+    def write(self, data: bytes) -> bool:
+        """Write data to serial port. Returns True if successful."""
+        with self.lock:
+            if not self.is_connected or not self.conn:
+                return False
+            try:
+                if self.conn.is_open:
+                    self.conn.write(data)
+                    self.conn.flush()
+                    return True
+            except Exception:
+                self.is_connected = False
+                if self.conn:
+                    try:
+                        self.conn.close()
+                    except:
+                        pass
+                    self.conn = None
+            return False
+    
+    def read_available(self) -> str:
+        """Read available data from serial port. Returns empty string if nothing available."""
+        with self.lock:
+            if not self.is_connected or not self.conn:
+                return ""
+            try:
+                if self.conn.in_waiting > 0:
+                    return self.conn.read(self.conn.in_waiting).decode('utf-8', errors='ignore')
+            except Exception:
+                pass
+            return ""
+
+# --- Video Manager (Compartmentalized) ---------------------------------------
+
+class VideoManager:
+    """Manages video stream capture."""
+    def __init__(self, url: str):
+        self.url = url
+        self.cap = None
+        self.is_connected = False
+        
+    def connect(self) -> bool:
+        """Connect to video stream. Returns True if successful."""
+        if self.is_connected:
+            return True
+        try:
+            if self.url.startswith("http://") or self.url.startswith("https://"):
+                self.cap = cv2.VideoCapture(self.url)
+            else:
+                self.cap = cv2.VideoCapture(self.url, cv2.CAP_FFMPEG)
+                if not self.cap.isOpened():
+                    self.cap = cv2.VideoCapture(self.url)
+            
+            if self.cap.isOpened():
+                self.cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                self.is_connected = True
+                return True
+        except Exception:
+            pass
+        return False
+    
+    def disconnect(self):
+        """Disconnect from video stream."""
+        if self.cap:
+            try:
+                self.cap.release()
+            except:
+                pass
+            self.cap = None
+        self.is_connected = False
+    
+    def read_frame(self) -> Optional[np.ndarray]:
+        """Read a frame from the stream. Returns None if failed."""
+        if not self.is_connected or not self.cap:
+            return None
+        try:
+            ok, frame = self.cap.read()
+            if ok and frame is not None:
+                return frame
+        except Exception:
+            pass
+        return None
+
+# --- GUI Application ---------------------------------------------------------
+
+class LeafBotGUI:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("LeafBot Vision Control")
+        self.root.geometry("1200x700")
+        
+        # Managers (compartmentalized)
+        self.serial_manager = None
+        self.video_manager = None
+        self.detector = None
+        
+        # State
+        self.is_connected = False
+        self.stop_threads = False
+        self.video_thread = None
+        self.serial_thread = None
+        
+        # Queues
+        self.video_queue = queue.Queue(maxsize=2)
+        self.serial_output_queue = queue.Queue()
+        
+        # FPS tracking
+        self.prev_t = time.time()
+        self.fps = 0.0
+        
+        # Serial send throttling
+        self.last_serial_send_time = 0
+        self.serial_send_interval = 0.05  # 50ms = 20 Hz max
+        
+        self.setup_ui()
+        self.start_periodic_updates()
+        
+    def setup_ui(self):
+        """Set up the user interface."""
+        main_frame = ttk.Frame(self.root, padding="10")
+        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.root.columnconfigure(0, weight=1)
+        self.root.rowconfigure(0, weight=1)
+        
+        # Left panel
+        left_panel = ttk.Frame(main_frame)
+        left_panel.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 10))
+        
+        # Connection controls
+        conn_frame = ttk.LabelFrame(left_panel, text="Connection Settings", padding="10")
+        conn_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        ttk.Label(conn_frame, text="Stream URL:").grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.rtsp_entry = ttk.Entry(conn_frame, width=40)
+        self.rtsp_entry.insert(0, "http://192.168.1.230/stream")
+        self.rtsp_entry.grid(row=0, column=1, columnspan=2, sticky=(tk.W, tk.E), pady=5, padx=5)
+        
+        ttk.Label(conn_frame, text="Serial Port:").grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.serial_combo = ttk.Combobox(conn_frame, width=25, state="readonly")
+        self.serial_combo.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=5, padx=5)
+        self.refresh_serial_ports()
+        
+        refresh_btn = ttk.Button(conn_frame, text="Refresh", command=self.refresh_serial_ports, width=10)
+        refresh_btn.grid(row=1, column=2, padx=5)
+        
+        self.connect_btn = ttk.Button(conn_frame, text="Connect", command=self.toggle_connection, width=20)
+        self.connect_btn.grid(row=2, column=0, columnspan=3, pady=10)
+        
+        self.status_label = ttk.Label(conn_frame, text="Status: Disconnected", foreground="red")
+        self.status_label.grid(row=3, column=0, columnspan=3, pady=5)
+        
+        # Control sliders
+        control_frame = ttk.LabelFrame(left_panel, text="Manual Control", padding="10")
+        control_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
+        
+        speed_frame = ttk.Frame(control_frame)
+        speed_frame.grid(row=0, column=0, padx=10, pady=5)
+        ttk.Label(speed_frame, text="Speed").pack()
+        self.speed_var = tk.IntVar(value=0)
+        self.speed_scale = tk.Scale(speed_frame, from_=-100, to=100, orient=tk.VERTICAL, 
+                                    variable=self.speed_var, length=200, command=self.on_slider_change)
+        self.speed_scale.pack()
+        self.speed_value_label = ttk.Label(speed_frame, text="0")
+        self.speed_value_label.pack()
+        
+        turn_frame = ttk.Frame(control_frame)
+        turn_frame.grid(row=0, column=1, padx=10, pady=5)
+        ttk.Label(turn_frame, text="Turn").pack()
+        self.turn_var = tk.IntVar(value=0)
+        self.turn_scale = tk.Scale(turn_frame, from_=-100, to=100, orient=tk.VERTICAL,
+                                   variable=self.turn_var, length=200, command=self.on_slider_change)
+        self.turn_scale.pack()
+        self.turn_value_label = ttk.Label(turn_frame, text="0")
+        self.turn_value_label.pack()
+        
+        # Serial output
+        serial_frame = ttk.LabelFrame(left_panel, text="Serial Output", padding="10")
+        serial_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
+        
+        self.serial_text = scrolledtext.ScrolledText(serial_frame, width=50, height=15, wrap=tk.WORD)
+        self.serial_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        self.serial_text.config(state=tk.DISABLED)
+        
+        clear_btn = ttk.Button(serial_frame, text="Clear", command=self.clear_serial_output)
+        clear_btn.grid(row=1, column=0, pady=5)
+        
+        # Right panel - Video
+        right_panel = ttk.Frame(main_frame)
+        right_panel.grid(row=0, column=1, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        video_frame = ttk.LabelFrame(right_panel, text="Video Feed", padding="10")
+        video_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+        
+        self.video_label = ttk.Label(video_frame, text="No video feed", background="black", foreground="white")
+        self.video_label.grid(row=0, column=0)
+        
+        # Grid weights
+        main_frame.columnconfigure(0, weight=0)
+        main_frame.columnconfigure(1, weight=1)
+        main_frame.rowconfigure(0, weight=1)
+        left_panel.columnconfigure(0, weight=1)
+        left_panel.rowconfigure(2, weight=1)
+        right_panel.columnconfigure(0, weight=1)
+        right_panel.rowconfigure(0, weight=1)
+        conn_frame.columnconfigure(1, weight=1)
+        serial_frame.columnconfigure(0, weight=1)
+        serial_frame.rowconfigure(0, weight=1)
+        
+    def refresh_serial_ports(self):
+        """Refresh available serial ports."""
+        ports = [port.device for port in serial.tools.list_ports.comports()]
+        self.serial_combo['values'] = ports
+        if ports and not self.serial_combo.get():
+            self.serial_combo.current(0)
+    
+    def clear_serial_output(self):
+        """Clear serial output text."""
+        self.serial_text.config(state=tk.NORMAL)
+        self.serial_text.delete(1.0, tk.END)
+        self.serial_text.config(state=tk.DISABLED)
+    
+    def append_serial_output(self, text: str):
+        """Append text to serial output (thread-safe via queue)."""
+        try:
+            self.serial_output_queue.put(text, block=False)
+        except queue.Full:
+            pass
+    
+    def on_slider_change(self, value=None):
+        """Handle slider changes - send serial command."""
+        if not self.is_connected or not self.serial_manager:
+            return
+        
+        try:
+            speed = self.speed_var.get()
+            turn = self.turn_var.get()
+            
+            # Update labels
+            self.speed_value_label.config(text=str(speed))
+            self.turn_value_label.config(text=str(turn))
+            
+            # Throttle sends
+            current_time = time.time()
+            if current_time - self.last_serial_send_time < self.serial_send_interval:
+                return
+            
+            # Send command
+            command = f"S:{speed},T:{turn}\n"
+            if self.serial_manager.write(command.encode('utf-8')):
+                self.last_serial_send_time = current_time
+        except Exception:
+            pass  # Silently ignore errors to prevent crashes
+    
+    def toggle_connection(self):
+        """Connect or disconnect."""
+        if not self.is_connected:
+            self.connect()
+        else:
+            self.disconnect()
+    
+    def connect(self):
+        """Connect to stream and serial."""
+        rtsp_url = self.rtsp_entry.get().strip()
+        serial_port = self.serial_combo.get()
+        
+        if not rtsp_url:
+            messagebox.showerror("Error", "Please enter a stream URL")
+            return
+        
+        # Connect video
+        self.video_manager = VideoManager(rtsp_url)
+        if self.video_manager.connect():
+            self.append_serial_output(f"Stream connected: {rtsp_url}\n")
+        else:
+            self.append_serial_output(f"Warning: Could not connect to stream (continuing without video)\n")
+            self.video_manager = None
+        
+        # Connect serial
+        if serial_port:
+            self.serial_manager = SerialManager(serial_port, 115200)
+            if self.serial_manager.connect():
+                self.append_serial_output(f"Serial connected: {serial_port}\n")
+            else:
+                self.append_serial_output(f"Error: Could not connect to serial port\n")
+                self.serial_manager = None
+        else:
+            self.serial_manager = None
+        
+        if not self.video_manager and not self.serial_manager:
+            messagebox.showerror("Error", "Could not connect to stream or serial port")
+            return
+        
+        # Start threads
+        self.is_connected = True
+        self.stop_threads = False
+        
+        if self.video_manager:
+            self.video_thread = threading.Thread(target=self.video_loop, daemon=True)
+            self.video_thread.start()
+        
+        if self.serial_manager:
+            self.serial_thread = threading.Thread(target=self.serial_loop, daemon=True)
+            self.serial_thread.start()
+            self.speed_scale.config(state=tk.NORMAL)
+            self.turn_scale.config(state=tk.NORMAL)
+        
+        # Update UI
+        self.connect_btn.config(text="Disconnect")
+        self.status_label.config(text="Status: Connected", foreground="green")
+        self.rtsp_entry.config(state=tk.DISABLED)
+        self.serial_combo.config(state=tk.DISABLED)
+    
+    def disconnect(self):
+        """Disconnect from stream and serial."""
+        # Stop threads first
+        self.stop_threads = True
+        self.is_connected = False
+        
+        # Wait for threads to finish
+        if self.video_thread:
+            self.video_thread.join(timeout=1.0)
+            self.video_thread = None
+        if self.serial_thread:
+            self.serial_thread.join(timeout=1.0)
+            self.serial_thread = None
+        
+        # Disconnect managers
+        if self.video_manager:
+            self.video_manager.disconnect()
+            self.video_manager = None
+        
+        if self.serial_manager:
+            self.serial_manager.disconnect()
+            self.serial_manager = None
+        
+        # Clear queues
+        while not self.video_queue.empty():
+            try:
+                self.video_queue.get_nowait()
+            except:
+                pass
+        while not self.serial_output_queue.empty():
+            try:
+                self.serial_output_queue.get_nowait()
+            except:
+                pass
+        
+        # Update UI
+        self.video_label.config(image='', text="No video feed")
+        self.connect_btn.config(text="Connect")
+        self.status_label.config(text="Status: Disconnected", foreground="red")
+        self.rtsp_entry.config(state=tk.NORMAL)
+        self.serial_combo.config(state="readonly")
+        self.speed_scale.config(state=tk.DISABLED)
+        self.turn_scale.config(state=tk.DISABLED)
+        self.speed_var.set(0)
+        self.turn_var.set(0)
+        self.speed_value_label.config(text="0")
+        self.turn_value_label.config(text="0")
+        self.append_serial_output("Disconnected.\n")
+    
+    def video_loop(self):
+        """Video capture thread."""
+        while not self.stop_threads and self.is_connected:
+            if not self.video_manager:
+                break
+            
+            frame = self.video_manager.read_frame()
+            if frame is None:
+                time.sleep(0.1)
+                continue
+            
+            try:
+                H, W = frame.shape[:2]
+                
+                # Show FPS
+                now = time.time()
+                dt = now - self.prev_t
+                if dt > 0:
+                    self.fps = 1.0 / dt
+                self.prev_t = now
+                
+                cv2.putText(frame, f"FPS: {self.fps:.1f}", (8,20), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                
+                # Resize for display
+                display_frame = frame.copy()
+                max_w, max_h = 800, 600
+                if W > max_w or H > max_h:
+                    scale = min(max_w / W, max_h / H)
+                    new_w, new_h = int(W * scale), int(H * scale)
+                    display_frame = cv2.resize(display_frame, (new_w, new_h))
+                
+                # Convert to RGB
+                display_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
+                
+                # Put in queue
+                try:
+                    if not self.video_queue.full():
+                        self.video_queue.put(display_frame, block=False)
+                except:
+                    pass
+            except Exception:
+                pass
+            
+            time.sleep(0.033)
+    
+    def serial_loop(self):
+        """Serial read thread."""
+        buffer = ""
+        while not self.stop_threads and self.is_connected:
+            if not self.serial_manager:
+                break
+            
+            try:
+                data = self.serial_manager.read_available()
+                if data:
+                    buffer += data
+                    while '\n' in buffer:
+                        line, buffer = buffer.split('\n', 1)
+                        if line.strip():
+                            self.append_serial_output(line.strip() + '\n')
+            except Exception:
+                pass
+            
+            time.sleep(0.01)
+    
+    def start_periodic_updates(self):
+        """Start periodic UI updates from queues."""
+        self.update_from_queues()
+    
+    def update_from_queues(self):
+        """Update UI from queues (runs in main thread)."""
+        # Update video display
+        try:
+            if not self.video_queue.empty():
+                display_frame = self.video_queue.get(block=False)
+                img = Image.fromarray(display_frame)
+                img_tk = ImageTk.PhotoImage(image=img)
+                self.video_label.config(image=img_tk, text="")
+                self.video_label.image = img_tk
+        except:
+            pass
+        
+        # Update serial output
+        try:
+            while not self.serial_output_queue.empty():
+                text = self.serial_output_queue.get(block=False)
+                self.serial_text.config(state=tk.NORMAL)
+                self.serial_text.insert(tk.END, text)
+                self.serial_text.see(tk.END)
+                self.serial_text.config(state=tk.DISABLED)
+        except:
+            pass
+        
+        # Schedule next update
+        self.root.after(33, self.update_from_queues)
+    
+    def on_closing(self):
+        """Handle window closing."""
+        if self.is_connected:
+            self.disconnect()
+        self.root.destroy()
+
 # --- Main ---------------------------------------------------------------------
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--source", type=str, required=True,
-                    help="RTSP or MJPEG URL (e.g., rtsp://..., http://.../mjpg)")
-    ap.add_argument("--model", type=str, default="yolo", choices=["yolo", "efficientdet"],
-                    help="Detector backend")
-    ap.add_argument("--model-name", type=str, default="yolov8n.pt",
-                    help="YOLO: .pt name; EfficientDet: efficientdet_lite0/1/2")
-    ap.add_argument("--device", type=str, default="cpu",
-                    help="YOLO device hint: cpu, mps, cuda (if available)")
-    ap.add_argument("--conf", type=float, default=0.4, help="Confidence threshold")
-    ap.add_argument("--target-h-frac", type=float, default=0.45,
-                    help="Desired bbox height as fraction of frame height (for future distance control)")
-    ap.add_argument("--pick", type=str, default="largest", choices=["largest", "conf"],
-                    help="How to pick one target among multiple persons")
-    ap.add_argument("--show", action="store_true", help="Show UI window")
-    args = ap.parse_args()
-
-    # Init detector
-    if args.model == "yolo":
-        det = YoloDetector(model_name=args.model_name, device=args.device, conf_thres=args.conf)
-    else:
-        det = EfficientDetDetector(model_name=args.model_name, conf_thres=args.conf)
-
-    # Open stream (OpenCV handles RTSP/MJPEG)
-    # Note: You can hint FFMPEG with CAP_FFMPEG if needed.
-    cap = cv2.VideoCapture(args.source)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open source: {args.source}")
-
-    prev_t = time.time()
-    fps = 0.0
-
-    # Main loop
-    while True:
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            # Try a brief wait/retry
-            if cv2.waitKey(5) & 0xFF == ord('q'):
-                break
-            continue
-
-        H, W = frame.shape[:2]
-
-        # Detect
-        detections = det.detect(frame)
-
-        # Pick your subject
-        target = pick_target(detections, strategy=args.pick)
-
-        # Draw & compute control-friendly values
-        if target is not None:
-            ex, ez = compute_errors(target.xyxy, W, H, args.target_h_frac)
-            # In the future, you'd feed (ex, ez) to your controller → (v, omega)
-            draw_bbox(frame, target, ex, ez, fps)
-        else:
-            cv2.putText(frame, f"FPS: {fps:.1f}", (8,20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
-            cv2.putText(frame, "No person detected", (8,46), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
-
-        if args.show:
-            cv2.imshow("LeafBot Vision", frame)
-            if cv2.waitKey(1) & 0xFF == ord('q'):
-                break
-
-        # FPS calc
-        now = time.time()
-        dt = now - prev_t
-        if dt > 0:
-            fps = 1.0 / dt
-        prev_t = now
-
-    cap.release()
-    cv2.destroyAllWindows()
+    root = tk.Tk()
+    app = LeafBotGUI(root)
+    root.protocol("WM_DELETE_WINDOW", app.on_closing)
+    root.mainloop()
 
 if __name__ == "__main__":
     main()

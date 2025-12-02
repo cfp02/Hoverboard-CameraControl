@@ -1,6 +1,8 @@
 
 opencv-python
 numpy
+pyserial
+Pillow
 
 # Option A: YOLO (easy, fast to start, auto-downloads models)
 ultralytics
