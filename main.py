@@ -423,6 +423,16 @@ class LeafBotGUI:
             messagebox.showerror("Error", "Could not connect to stream or serial port")
             return
         
+        # Initialize YOLO detector if we have video
+        if self.video_manager and self.detector is None:
+            try:
+                self.append_serial_output("Initializing YOLO detector...\n")
+                self.detector = YoloDetector(model_name="yolov8n.pt", device="cpu", conf_thres=0.4)
+                self.append_serial_output("YOLO detector initialized.\n")
+            except Exception as e:
+                self.append_serial_output(f"Warning: Could not initialize detector: {e}\n")
+                self.detector = None
+        
         # Start threads
         self.is_connected = True
         self.stop_threads = False
@@ -506,15 +516,40 @@ class LeafBotGUI:
             try:
                 H, W = frame.shape[:2]
                 
-                # Show FPS
+                # Run YOLO detection if detector is available
+                if self.detector:
+                    try:
+                        detections = self.detector.detect(frame)
+                        target = pick_target(detections, strategy="largest")
+                        
+                        if target is not None:
+                            # Compute control errors (for future use)
+                            ex, ez = compute_errors(target.xyxy, W, H, target_h_frac=0.45)
+                            # Draw bounding box and info
+                            draw_bbox(frame, target, ex, ez, self.fps)
+                        else:
+                            # No person detected
+                            cv2.putText(frame, f"FPS: {self.fps:.1f}", (8,20), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                            cv2.putText(frame, "No person detected", (8,46), 
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2, cv2.LINE_AA)
+                    except Exception as e:
+                        # If detection fails, just show FPS
+                        cv2.putText(frame, f"FPS: {self.fps:.1f}", (8,20), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                        cv2.putText(frame, "Detection error", (8,46), 
+                                  cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,0), 2, cv2.LINE_AA)
+                else:
+                    # No detector - just show FPS
+                    cv2.putText(frame, f"FPS: {self.fps:.1f}", (8,20), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
+                
+                # Calculate FPS
                 now = time.time()
                 dt = now - self.prev_t
                 if dt > 0:
                     self.fps = 1.0 / dt
                 self.prev_t = now
-                
-                cv2.putText(frame, f"FPS: {self.fps:.1f}", (8,20), 
-                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,255), 2, cv2.LINE_AA)
                 
                 # Resize for display
                 display_frame = frame.copy()
