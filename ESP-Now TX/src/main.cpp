@@ -127,16 +127,16 @@ void loop() {
           if (speedStr.endsWith(",")) {
             speedStr = speedStr.substring(0, speedStr.length() - 1);
           }
-          speed = speedStr.toInt();
+          float speedFloat = speedStr.toFloat();
           
           // Extract steer (after T:)
           String steerStr = serialBuffer.substring(tIdx + 2);
           steerStr.trim();
-          steer = steerStr.toInt();
+          float steerFloat = steerStr.toFloat();
           
-          // Clamp values to [-100, 100]
-          speed = constrain(speed, -100, 100);
-          steer = constrain(steer, -100, 100);
+          // Convert to integer in range [-1000, 1000] by multiplying by 10
+          speed = constrain((int)roundf(speedFloat * 10.0f), -1000, 1000);
+          steer = constrain((int)roundf(steerFloat * 10.0f), -1000, 1000);
           
           // Update last values
           lastSpeed = speed;

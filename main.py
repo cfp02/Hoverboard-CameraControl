@@ -295,21 +295,23 @@ class LeafBotGUI:
         speed_frame = ttk.Frame(control_frame)
         speed_frame.grid(row=0, column=0, padx=10, pady=5)
         ttk.Label(speed_frame, text="Speed").pack()
-        self.speed_var = tk.IntVar(value=0)
-        self.speed_scale = tk.Scale(speed_frame, from_=-100, to=100, orient=tk.VERTICAL, 
-                                    variable=self.speed_var, length=200, command=self.on_slider_change)
+        self.speed_var = tk.DoubleVar(value=0.0)
+        self.speed_scale = tk.Scale(speed_frame, from_=-100.0, to=100.0, orient=tk.VERTICAL, 
+                                    variable=self.speed_var, length=200, resolution=0.1, 
+                                    command=self.on_slider_change)
         self.speed_scale.pack()
-        self.speed_value_label = ttk.Label(speed_frame, text="0")
+        self.speed_value_label = ttk.Label(speed_frame, text="0.0")
         self.speed_value_label.pack()
         
         turn_frame = ttk.Frame(control_frame)
         turn_frame.grid(row=0, column=1, padx=10, pady=5)
         ttk.Label(turn_frame, text="Turn").pack()
-        self.turn_var = tk.IntVar(value=0)
-        self.turn_scale = tk.Scale(turn_frame, from_=-100, to=100, orient=tk.VERTICAL,
-                                   variable=self.turn_var, length=200, command=self.on_slider_change)
+        self.turn_var = tk.DoubleVar(value=0.0)
+        self.turn_scale = tk.Scale(turn_frame, from_=-100.0, to=100.0, orient=tk.VERTICAL,
+                                   variable=self.turn_var, length=200, resolution=0.1,
+                                   command=self.on_slider_change)
         self.turn_scale.pack()
-        self.turn_value_label = ttk.Label(turn_frame, text="0")
+        self.turn_value_label = ttk.Label(turn_frame, text="0.0")
         self.turn_value_label.pack()
         
         # Status display frame (to the right of manual controls)
@@ -428,17 +430,21 @@ class LeafBotGUI:
             speed = self.speed_var.get()
             turn = self.turn_var.get()
             
-            # Update labels
-            self.speed_value_label.config(text=str(speed))
-            self.turn_value_label.config(text=str(turn))
+            # Clamp to valid range
+            speed = max(-100.0, min(100.0, float(speed)))
+            turn = max(-100.0, min(100.0, float(turn)))
+            
+            # Update labels with one decimal place
+            self.speed_value_label.config(text=f"{speed:.1f}")
+            self.turn_value_label.config(text=f"{turn:.1f}")
             
             # Throttle sends
             current_time = time.time()
             if current_time - self.last_serial_send_time < self.serial_send_interval:
                 return
             
-            # Send command
-            command = f"S:{speed},T:{turn}\n"
+            # Send command with decimal precision (one decimal place)
+            command = f"S:{speed:.1f},T:{turn:.1f}\n"
             command_bytes = command.encode('utf-8')
             if self.serial_manager.write(command_bytes):
                 self.last_serial_send_time = current_time
@@ -559,10 +565,10 @@ class LeafBotGUI:
         self.serial_combo.config(state="readonly")
         self.speed_scale.config(state=tk.DISABLED)
         self.turn_scale.config(state=tk.DISABLED)
-        self.speed_var.set(0)
-        self.turn_var.set(0)
-        self.speed_value_label.config(text="0")
-        self.turn_value_label.config(text="0")
+        self.speed_var.set(0.0)
+        self.turn_var.set(0.0)
+        self.speed_value_label.config(text="0.0")
+        self.turn_value_label.config(text="0.0")
         self.append_serial_output("Disconnected.\n")
     
     def video_loop(self):
@@ -574,11 +580,11 @@ class LeafBotGUI:
             frame = self.video_manager.read_frame()
             if frame is None:
                 time.sleep(0.1)
-                continue
+            continue
 
             try:
                 H, W = frame.shape[:2]
-
+                
                 # Run YOLO detection if detector is available
                 if self.detector:
                     try:
