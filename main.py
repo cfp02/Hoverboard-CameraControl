@@ -245,6 +245,12 @@ class LeafBotGUI:
         self.last_serial_send_time = 0
         self.serial_send_interval = 0.05  # 50ms = 20 Hz max
         
+        # Feedback status values
+        self.battery_voltage = 0.0
+        self.left_speed = 0
+        self.right_speed = 0
+        self.cpu_temp = 0.0
+        
         self.setup_ui()
         self.start_periodic_updates()
         
@@ -306,6 +312,30 @@ class LeafBotGUI:
         self.turn_value_label = ttk.Label(turn_frame, text="0")
         self.turn_value_label.pack()
         
+        # Status display frame (to the right of manual controls)
+        status_frame = ttk.LabelFrame(left_panel, text="Hoverboard Status", padding="10")
+        status_frame.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N), padx=(10, 0), pady=(0, 10))
+        
+        # Battery voltage
+        ttk.Label(status_frame, text="Battery Voltage:", font=("Arial", 9)).grid(row=0, column=0, sticky=tk.W, pady=5)
+        self.battery_label = ttk.Label(status_frame, text="-- V", font=("Arial", 10, "bold"), foreground="green")
+        self.battery_label.grid(row=0, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        
+        # Left speed
+        ttk.Label(status_frame, text="Left Speed:", font=("Arial", 9)).grid(row=1, column=0, sticky=tk.W, pady=5)
+        self.left_speed_label = ttk.Label(status_frame, text="-- RPM", font=("Arial", 10, "bold"))
+        self.left_speed_label.grid(row=1, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        
+        # Right speed
+        ttk.Label(status_frame, text="Right Speed:", font=("Arial", 9)).grid(row=2, column=0, sticky=tk.W, pady=5)
+        self.right_speed_label = ttk.Label(status_frame, text="-- RPM", font=("Arial", 10, "bold"))
+        self.right_speed_label.grid(row=2, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        
+        # CPU temperature
+        ttk.Label(status_frame, text="CPU Temp:", font=("Arial", 9)).grid(row=3, column=0, sticky=tk.W, pady=5)
+        self.temp_label = ttk.Label(status_frame, text="-- °C", font=("Arial", 10, "bold"))
+        self.temp_label.grid(row=3, column=1, sticky=tk.W, padx=(10, 0), pady=5)
+        
         # Serial output
         serial_frame = ttk.LabelFrame(left_panel, text="Serial Output", padding="10")
         serial_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(0, 10))
@@ -332,6 +362,7 @@ class LeafBotGUI:
         main_frame.columnconfigure(1, weight=1)
         main_frame.rowconfigure(0, weight=1)
         left_panel.columnconfigure(0, weight=1)
+        left_panel.columnconfigure(1, weight=0)  # Status frame doesn't need to expand
         left_panel.rowconfigure(2, weight=1)
         right_panel.columnconfigure(0, weight=1)
         right_panel.rowconfigure(0, weight=1)
@@ -357,6 +388,35 @@ class LeafBotGUI:
         try:
             self.serial_output_queue.put(text, block=False)
         except queue.Full:
+            pass
+    
+    def parse_feedback_message(self, text: str):
+        """Parse feedback message format: V:42.0V L:0 R:0 T:45.7C"""
+        import re
+        # Pattern: V:42.0V L:0 R:0 T:45.7C
+        pattern = r'V:([\d.]+)V\s+L:(-?\d+)\s+R:(-?\d+)\s+T:([\d.]+)C'
+        match = re.search(pattern, text)
+        if match:
+            try:
+                self.battery_voltage = float(match.group(1))
+                self.left_speed = int(match.group(2))
+                self.right_speed = int(match.group(3))
+                self.cpu_temp = float(match.group(4))
+                # Update UI labels (must be done in main thread)
+                self.root.after(0, self.update_status_display)
+                return True
+            except (ValueError, IndexError):
+                pass
+        return False
+    
+    def update_status_display(self):
+        """Update status display labels with current feedback values."""
+        try:
+            self.battery_label.config(text=f"{self.battery_voltage:.1f} V")
+            self.left_speed_label.config(text=f"{self.left_speed} RPM")
+            self.right_speed_label.config(text=f"{self.right_speed} RPM")
+            self.temp_label.config(text=f"{self.cpu_temp:.1f} °C")
+        except:
             pass
     
     def on_slider_change(self, value=None):
@@ -515,10 +575,10 @@ class LeafBotGUI:
             if frame is None:
                 time.sleep(0.1)
                 continue
-            
+
             try:
                 H, W = frame.shape[:2]
-                
+
                 # Run YOLO detection if detector is available
                 if self.detector:
                     try:
@@ -582,7 +642,7 @@ class LeafBotGUI:
         while not self.stop_threads and self.is_connected:
             if not self.serial_manager:
                 break
-            
+
             try:
                 data = self.serial_manager.read_available()
                 if data:
@@ -617,10 +677,14 @@ class LeafBotGUI:
         try:
             while not self.serial_output_queue.empty():
                 text = self.serial_output_queue.get(block=False)
-                self.serial_text.config(state=tk.NORMAL)
-                self.serial_text.insert(tk.END, text)
-                self.serial_text.see(tk.END)
-                self.serial_text.config(state=tk.DISABLED)
+                
+                # Try to parse as feedback message first
+                if not self.parse_feedback_message(text):
+                    # Not a feedback message, add to serial output
+                    self.serial_text.config(state=tk.NORMAL)
+                    self.serial_text.insert(tk.END, text)
+                    self.serial_text.see(tk.END)
+                    self.serial_text.config(state=tk.DISABLED)
         except:
             pass
         

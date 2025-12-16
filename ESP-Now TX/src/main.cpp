@@ -28,14 +28,14 @@ void onFeedback(const SerialFeedback& feedback) {
   // Only print every 500ms
   if ((now - lastFeedbackPrint) >= FEEDBACK_PRINT_INTERVAL_MS) {
     // Build entire line as a compact string
-    // Format: V:42.0V L:0 R:0 T:457C
+    // Format: V:42.0V L:0 R:0 T:45.7C
     char line[48];
     int len = snprintf(line, sizeof(line), 
-      "V:%.1fV L:%d R:%d T:%dC\n",
+      "V:%.1fV L:%d R:%d T:%.1fC\n",
       feedback.batVoltage / 100.0f,
       feedback.speedL_meas,
       feedback.speedR_meas,
-      feedback.boardTemp
+      feedback.boardTemp / 10.0f
     );
     
     // Use Serial.write to send entire string atomically (prevents corruption)
