@@ -17,6 +17,30 @@ struct __attribute__((packed)) ControlPacket {
   uint16_t crc;       // CRC16-CCITT checksum
 };
 
+// ===================== Feedback Packet Format =====================
+// Matches the structure sent by the hoverboard ESP32
+struct __attribute__((packed)) SerialFeedback {
+  uint16_t start;
+  int16_t  cmd1;
+  int16_t  cmd2;
+  int16_t  speedR_meas;
+  int16_t  speedL_meas;
+  int16_t  wheelR_cnt;    // Wheel right count
+  int16_t  wheelL_cnt;    // Wheel left count
+  int16_t  batVoltage;
+  int16_t  boardTemp;
+  uint16_t cmdLed;
+  uint16_t checksum;
+};
+
+struct __attribute__((packed)) FeedbackPacket {
+  SerialFeedback hb;
+  uint16_t crc;
+};
+
+// Callback function type for feedback packets
+typedef void (*FeedbackCallback)(const SerialFeedback& feedback);
+
 // ===================== HoverboardESPNow Class =====================
 class HoverboardESPNow {
 public:
@@ -68,8 +92,19 @@ public:
   
   // Calculate CRC16-CCITT for a packet (public for testing/external use)
   static uint16_t calculateCRC(const uint8_t* data, size_t len, uint16_t crc = 0xFFFF);
+  
+  // Set callback function for feedback packets from hoverboard
+  // Set to nullptr to disable feedback reception
+  void setFeedbackCallback(FeedbackCallback callback);
 
 private:
+  // Static callback wrapper (ESP-Now requires static callback)
+  static void _onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len);
+  
+  // Instance pointer for static callback
+  static HoverboardESPNow* _instance;
+  
+  FeedbackCallback _feedbackCallback;
   bool _initialized;
   bool _peerAdded;
   uint8_t _peerMac[6];

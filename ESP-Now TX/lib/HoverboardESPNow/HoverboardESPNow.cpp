@@ -1,9 +1,13 @@
 #include "HoverboardESPNow.h"
 
+// Static instance pointer for callback
+HoverboardESPNow* HoverboardESPNow::_instance = nullptr;
+
 // ===================== Constructor/Destructor =====================
 HoverboardESPNow::HoverboardESPNow() 
-  : _initialized(false), _peerAdded(false), _sequence(0) {
+  : _initialized(false), _peerAdded(false), _sequence(0), _feedbackCallback(nullptr) {
   memset(_peerMac, 0, 6);
+  _instance = this; // Set instance pointer
 }
 
 HoverboardESPNow::~HoverboardESPNow() {
@@ -59,6 +63,11 @@ bool HoverboardESPNow::begin(const uint8_t peerMac[6]) {
     return false;
   }
   
+  // Register receive callback if feedback callback is set
+  if (_feedbackCallback != nullptr) {
+    esp_now_register_recv_cb(_onEspNowRecv);
+  }
+  
   _initialized = true;
   return _addPeer(peerMac);
 }
@@ -72,6 +81,11 @@ bool HoverboardESPNow::begin(const char* nvsNamespace, const char* nvsKey) {
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     return false;
+  }
+  
+  // Register receive callback if feedback callback is set
+  if (_feedbackCallback != nullptr) {
+    esp_now_register_recv_cb(_onEspNowRecv);
   }
   
   _initialized = true;
@@ -93,6 +107,11 @@ bool HoverboardESPNow::begin() {
   WiFi.mode(WIFI_STA);
   if (esp_now_init() != ESP_OK) {
     return false;
+  }
+  
+  // Register receive callback if feedback callback is set
+  if (_feedbackCallback != nullptr) {
+    esp_now_register_recv_cb(_onEspNowRecv);
   }
   
   _initialized = true;
@@ -170,5 +189,36 @@ bool HoverboardESPNow::savePeerMacToNVS(const uint8_t mac[6], const char* nvsNam
   }
   
   return success;
+}
+
+// ===================== Feedback Callback =====================
+void HoverboardESPNow::setFeedbackCallback(FeedbackCallback callback) {
+  _feedbackCallback = callback;
+  
+  // If already initialized and callback is being set, register it
+  if (_initialized && _feedbackCallback != nullptr) {
+    esp_now_register_recv_cb(_onEspNowRecv);
+  }
+}
+
+void HoverboardESPNow::_onEspNowRecv(const uint8_t *mac, const uint8_t *data, int len) {
+  // Check if we have an instance and callback
+  if (_instance == nullptr || _instance->_feedbackCallback == nullptr) {
+    return;
+  }
+  
+  // Check if this is a feedback packet
+  if (len == sizeof(FeedbackPacket)) {
+    FeedbackPacket pkt;
+    memcpy(&pkt, data, sizeof(pkt));
+    
+    // Verify CRC16-CCITT (FeedbackPacket.crc is CRC16-CCITT of SerialFeedback structure)
+    uint16_t crcCalc = calculateCRC((uint8_t*)&pkt.hb, sizeof(pkt.hb));
+    
+    if (crcCalc == pkt.crc) {
+      // Call user callback with feedback data
+      _instance->_feedbackCallback(pkt.hb);
+    }
+  }
 }
 

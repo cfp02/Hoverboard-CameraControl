@@ -3,8 +3,9 @@
 #include "HoverboardESPNow.h"
 
 // ===================== MAC Address =====================
-// Receiver MAC address - update this to match your hoverboard receiver
-const uint8_t RECEIVER_MAC[6] = {0xAC, 0x67, 0xB2, 0x53, 0x86, 0x28};
+// Receiver MAC address 
+// const uint8_t RECEIVER_MAC[6] = {0xAC, 0x67, 0xB2, 0x53, 0x86, 0x28}; // Hoverboard 1, Tires
+const uint8_t RECEIVER_MAC[6] = {0x24, 0x0A, 0xC4, 0x1D, 0x29, 0xA0}; // Hoverboard 2, Solid wheels
 
 // ===================== Globals =====================
 HoverboardESPNow hoverboard;
@@ -16,6 +17,36 @@ const unsigned SEND_INTERVAL_MS = 20; // Send at ~50Hz like the original
 
 String serialBuffer = ""; // Buffer for accumulating serial input
 
+// Feedback rate limiting
+static uint32_t lastFeedbackPrint = 0;
+static const uint32_t FEEDBACK_PRINT_INTERVAL_MS = 20; // Printing every 20ms for better integration for position    // 500; // Print every 500ms
+
+// ===================== Feedback Callback =====================
+void onFeedback(const SerialFeedback& feedback) {
+  uint32_t now = millis();
+  
+  // Only print every 500ms
+  if ((now - lastFeedbackPrint) >= FEEDBACK_PRINT_INTERVAL_MS) {
+    // Build entire line as a compact string
+    // Format: V:42.0V L:0 R:0 T:457C
+    char line[48];
+    int len = snprintf(line, sizeof(line), 
+      "V:%.1fV L:%d R:%d T:%dC\n",
+      feedback.batVoltage / 100.0f,
+      feedback.speedL_meas,
+      feedback.speedR_meas,
+      feedback.boardTemp
+    );
+    
+    // Use Serial.write to send entire string atomically (prevents corruption)
+    if (len > 0 && len < sizeof(line)) {
+      Serial.write((const uint8_t*)line, len);
+    }
+    
+    lastFeedbackPrint = now;
+  }
+}
+
 // ===================== Setup =====================
 void setup() {
   Serial.begin(115200);
@@ -24,6 +55,9 @@ void setup() {
   Serial.println("ESP-NOW Passthrough");
   Serial.print("Local MAC: ");
   Serial.println(WiFi.macAddress());
+
+  // Register feedback callback BEFORE initializing (so it gets registered properly)
+  hoverboard.setFeedbackCallback(onFeedback);
 
   // Initialize ESP-Now with the receiver MAC
   if (!hoverboard.begin(RECEIVER_MAC)) {
@@ -49,6 +83,8 @@ void setup() {
   }
   
   Serial.println("ESP-Now initialized and ready!");
+  Serial.print("Receive callback registered: ");
+  Serial.println(hoverboard.isConnected() ? "YES" : "NO");
   
   // Send a few initial packets to help with receiver auto-pairing
   Serial.println("Sending initial packets for pairing...");
@@ -60,6 +96,8 @@ void setup() {
   Serial.println("Ready! Send commands as: S:<speed>,T:<steer>");
   Serial.println("Example: S:50,T:30");
   Serial.println("Packets are sent continuously at ~50Hz");
+  Serial.println("Waiting for feedback from hoverboard...");
+  Serial.println("(If no 'ESPNow RX' messages appear, hoverboard may not be sending feedback)");
 }
 
 // ===================== Loop =====================
@@ -104,17 +142,25 @@ void loop() {
           lastSpeed = speed;
           lastSteer = steer;
           
-          Serial.print("Updated: speed=");
+          Serial.print("RX: speed=");
           Serial.print(speed);
           Serial.print(", steer=");
-          Serial.println(steer);
+          Serial.print(steer);
+          // Serial.print(" | Sending to hoverboard...");
+          
+          // Immediately send one packet to verify it works
+          if (hoverboard.send(speed, steer)) {
+            // Serial.println(" OK");
+          } else {
+            Serial.println(" FAILED");
+          }
         } else {
           Serial.println("Invalid format! Use: S:<speed>,T:<steer>");
         }
         
         serialBuffer = ""; // Clear buffer
       }
-    } else {
+      } else {
       // Add character to buffer
       serialBuffer += c;
       // Prevent buffer overflow
@@ -131,7 +177,19 @@ void loop() {
     lastSendTime = now;
     
     // Send the last received values (or 0,0 if nothing received yet)
-    hoverboard.send(lastSpeed, lastSteer);
+    bool sent = hoverboard.send(lastSpeed, lastSteer);
+    
+    // Debug output every 1 second (50 sends)
+    static uint32_t lastDebugTime = 0;
+    if (now - lastDebugTime >= 1000) {
+      lastDebugTime = now;
+      Serial.print("TX: speed=");
+      Serial.print(lastSpeed);
+      Serial.print(", steer=");
+      Serial.print(lastSteer);
+      Serial.print(", status=");
+      Serial.println(sent ? "OK" : "FAIL");
+    }
   }
   
   delay(1); // Small delay

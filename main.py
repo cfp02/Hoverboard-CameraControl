@@ -379,8 +379,11 @@ class LeafBotGUI:
             
             # Send command
             command = f"S:{speed},T:{turn}\n"
-            if self.serial_manager.write(command.encode('utf-8')):
+            command_bytes = command.encode('utf-8')
+            if self.serial_manager.write(command_bytes):
                 self.last_serial_send_time = current_time
+                # Debug: optionally log sent commands (uncomment for debugging)
+                # self.append_serial_output(f"Sent: {command.strip()}\n")
         except Exception:
             pass  # Silently ignore errors to prevent crashes
     
