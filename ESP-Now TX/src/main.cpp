@@ -38,21 +38,30 @@ void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   
   // Packet from Drivetrain
   if (memcmp(mac, WHEEL_MAC, 6) == 0) {
-    // Cast to the struct defined in the library
-    if (len == sizeof(SerialFeedback)) {
-      const SerialFeedback* fb = (const SerialFeedback*)incomingData;
+    // Hoverboard sends FeedbackPacket (contains SerialFeedback + CRC)
+    if (len == sizeof(FeedbackPacket)) {
+      FeedbackPacket pkt;
+      memcpy(&pkt, incomingData, sizeof(pkt));
       
-      // Format: [W] V:42.0V L:0 R:0 T:45.7C
-      char line[64];
-      int l = snprintf(line, sizeof(line), 
-        "[W] V:%.1fV L:%d R:%d T:%.1fC\n",
-        fb->batVoltage / 100.0f,
-        fb->speedL_meas,
-        fb->speedR_meas,
-        fb->boardTemp / 10.0f
-      );
+      // Verify CRC16-CCITT (same as library does)
+      uint16_t crcCalc = HoverboardESPNow::calculateCRC((uint8_t*)&pkt.hb, sizeof(pkt.hb));
       
-      if (l > 0) Serial.write((const uint8_t*)line, l);
+      if (crcCalc == pkt.crc) {
+        // Access the SerialFeedback data from the packet
+        const SerialFeedback* fb = &pkt.hb;
+        
+        // Format: [W] V:42.0V L:0 R:0 T:45.7C
+        char line[64];
+        int l = snprintf(line, sizeof(line), 
+          "[W] V:%.1fV L:%d R:%d T:%.1fC\n",
+          fb->batVoltage / 100.0f,
+          fb->speedL_meas,
+          fb->speedR_meas,
+          fb->boardTemp / 10.0f
+        );
+        
+        if (l > 0) Serial.write((const uint8_t*)line, l);
+      }
     }
     return;
   }
