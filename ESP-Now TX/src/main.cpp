@@ -1,56 +1,118 @@
 #include <Arduino.h>
 #include <WiFi.h>
+#include <esp_now.h>
 #include "HoverboardESPNow.h"
 
-// ===================== MAC Address =====================
-// Receiver MAC address (Hoverboard 2, Solid wheels)
-const uint8_t RECEIVER_MAC[6] = {0x24, 0x0A, 0xC4, 0x1D, 0x29, 0xA0}; 
+// ===================== Configuration =====================
+
+// This ESP32 Mac: d8:3b:da:45:61:cc // Base Station
+
+// 1. WHEEL MAC (Receiver: Hoverboard 2, Solid wheels)
+const uint8_t WHEEL_MAC[6] = {0x24, 0x0A, 0xC4, 0x1D, 0x29, 0xA0}; 
+
+// 2. IMU MAC (ESP32-C3)
+const uint8_t IMU_MAC[6]   = {0x8C, 0xD0, 0xB2, 0xA8, 0x58, 0x39}; 
+
+// ===================== Data Structures =====================
+
+// IMU Control Packet (Base Station -> IMU C3)
+struct ImuControlPacket {
+  uint8_t msgType;    // 1 = Serial Command
+  uint8_t charData;   // e.g., 'e', 'q', 's'
+};
+
+// IMU Data Packet (IMU C3 -> Base Station)
+struct ImuDataPacket {
+  uint8_t msgType;    // 1 = Sideboard Data
+  uint8_t len;      
+  uint8_t payload[200];
+};
 
 // ===================== Globals =====================
 HoverboardESPNow hoverboard;
 String serialBuffer = ""; 
 
-// ===================== Feedback Callback =====================
-// Entirely Passive: If we get data from wheels, print it immediately.
-void onFeedback(const SerialFeedback& feedback) {
-  // Format: V:42.0V L:0 R:0 T:45.7C
-  // Added standard CSV-like formatting for easier parsing if needed later
-  // but keeping your specific format for now.
-  char line[64];
-  int len = snprintf(line, sizeof(line), 
-    "V:%.1fV L:%d R:%d T:%.1fC\n",
-    feedback.batVoltage / 100.0f,
-    feedback.speedL_meas,
-    feedback.speedR_meas,
-    feedback.boardTemp / 10.0f
-  );
+// ===================== Router Callback =====================
+// We overwrite the library's default callback so we can handle multiple peers.
+void onDataRecv(const uint8_t * mac, const uint8_t *incomingData, int len) {
   
-  if (len > 0 && len < sizeof(line)) {
-    Serial.write((const uint8_t*)line, len);
+  // Packet from Drivetrain
+  if (memcmp(mac, WHEEL_MAC, 6) == 0) {
+    // Cast to the struct defined in the library
+    if (len == sizeof(SerialFeedback)) {
+      const SerialFeedback* fb = (const SerialFeedback*)incomingData;
+      
+      // Format: [W] V:42.0V L:0 R:0 T:45.7C
+      char line[64];
+      int l = snprintf(line, sizeof(line), 
+        "[W] V:%.1fV L:%d R:%d T:%.1fC\n",
+        fb->batVoltage / 100.0f,
+        fb->speedL_meas,
+        fb->speedR_meas,
+        fb->boardTemp / 10.0f
+      );
+      
+      if (l > 0) Serial.write((const uint8_t*)line, l);
+    }
+    return;
+  }
+
+  // Packet from IMU
+  if (memcmp(mac, IMU_MAC, 6) == 0) {
+    if (len >= 2) {
+      const ImuDataPacket* pkt = (const ImuDataPacket*)incomingData;
+      
+      // Check for Sideboard Data Type (1)
+      if (pkt->msgType == 1) {
+        Serial.write("[I] ");
+        // Write payload directly
+        Serial.write(pkt->payload, pkt->len);
+        // Note: The sideboard usually sends the newline, so we don't add one.
+      }
+    }
+    return;
+  }
+}
+
+// ===================== Helpers =====================
+void addImuPeer() {
+  // Wheels are added by hoverboard.begin(), but we add IMU manually
+  if (esp_now_is_peer_exist(IMU_MAC)) return;
+  
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, IMU_MAC, 6);
+  peer.channel = 0; 
+  peer.encrypt = false;
+  
+  if (esp_now_add_peer(&peer) != ESP_OK) {
+    Serial.println("[Error] Failed to add IMU Peer");
   }
 }
 
 // ===================== Setup =====================
 void setup() {
-  // 115200 is okay, but 500000 or 921600 is better for high-speed ROS 
-  // if you change it here, remember to change it in your ROS node too.
   Serial.begin(115200);
   delay(1000);
   
-  // Register feedback callback
-  hoverboard.setFeedbackCallback(onFeedback);
-
-  // Initialize ESP-Now
-  if (!hoverboard.begin(RECEIVER_MAC)) {
+  // 1. Initialize Library (Sets up WiFi and Wheel Peer)
+  if (!hoverboard.begin(WHEEL_MAC)) {
     Serial.println("Error: ESP-Now Init Failed");
     while(1) delay(1000);
   }
   
-  // Save to NVS (optional, but keeps connection robust)
-  hoverboard.savePeerMacToNVS(RECEIVER_MAC, "hoverboard", "peerMac");
+  // 2. Register Router Callback
+  // This overwrites the callback set by hoverboard.begin()
+  esp_now_register_recv_cb(onDataRecv);
   
-  // Blink LED or print small startup msg so you know it didn't bootloop
-  Serial.println("--- PASSIVE BASE STATION READY ---");
+  // 3. Add IMU Peer
+  addImuPeer();
+  
+  // 4. Persistence (Optional, for wheels)
+  hoverboard.savePeerMacToNVS(WHEEL_MAC, "hoverboard", "peerMac");
+
+  Serial.println("--- ROUTER STATION READY ---");
+  Serial.println("Send '[W] S:50,T:0' for Wheels");
+  Serial.println("Send '[I] e' for IMU");
 }
 
 // ===================== Loop =====================
@@ -59,52 +121,56 @@ void loop() {
   while (Serial.available() > 0) {
     char c = Serial.read();
     
-    // Check for command termination (Newline)
+    // Check for command termination
     if (c == '\n' || c == '\r') {
       if (serialBuffer.length() > 0) {
         serialBuffer.trim();
         
-        // Expected Format: S:<speed>,T:<steer>
-        // Example: S:100,T:50
-        
-        int sIdx = serialBuffer.indexOf("S:");
-        int tIdx = serialBuffer.indexOf("T:");
-        
-        if (sIdx >= 0 && tIdx >= 0) {
-          // --- 1. Parse Speed ---
-          String speedStr = serialBuffer.substring(sIdx + 2, tIdx);
-          if (speedStr.endsWith(",")) speedStr.remove(speedStr.length() - 1);
-          float speedFloat = speedStr.toFloat();
+        // -------------------------------------------------
+        // ROUTE TO WHEELS: "[W] S:100,T:50"
+        // -------------------------------------------------
+        if (serialBuffer.startsWith("[W]")) {
+          int sIdx = serialBuffer.indexOf("S:");
+          int tIdx = serialBuffer.indexOf("T:");
           
-          // --- 2. Parse Steer ---
-          String steerStr = serialBuffer.substring(tIdx + 2);
-          float steerFloat = steerStr.toFloat();
-          
-          // --- 3. Constrain & Convert ---
-          // Multiplied by 10 as per your previous logic (-100.0 -> -1000)
-          int speed = constrain((int)roundf(speedFloat * 10.0f), -1000, 1000);
-          int steer = constrain((int)roundf(steerFloat * 10.0f), -1000, 1000);
-          
-          // --- 4. SEND IMMEDIATELY ---
-          // No timers, no rate limits. If ROS sends 100 commands/sec, we try to send 100/sec.
-          hoverboard.send(speed, steer);
-          
-          // Optional: Uncomment for debug, but better to keep silent for ROS
-          // Serial.print("TX: "); Serial.print(speed); Serial.print(" "); Serial.println(steer);
-          
-        } else {
-          // Only print error if buffer wasn't empty/junk
-          // Serial.println("Err: fmt");
+          if (sIdx >= 0 && tIdx >= 0) {
+            String speedStr = serialBuffer.substring(sIdx + 2, tIdx);
+            if (speedStr.endsWith(",")) speedStr.remove(speedStr.length() - 1);
+            String steerStr = serialBuffer.substring(tIdx + 2);
+            
+            // Convert to +/- 1000 range
+            int speed = constrain((int)roundf(speedStr.toFloat() * 10.0f), -1000, 1000);
+            int steer = constrain((int)roundf(steerStr.toFloat() * 10.0f), -1000, 1000);
+            
+            // Use Library to Send
+            hoverboard.send(speed, steer);
+          }
         }
+        
+        // -------------------------------------------------
+        // ROUTE TO IMU: "[I] e"
+        // -------------------------------------------------
+        else if (serialBuffer.startsWith("[I]")) {
+          int spaceIdx = serialBuffer.indexOf(' ');
+          // Ensure there is a character after the space
+          if (spaceIdx >= 0 && spaceIdx + 1 < serialBuffer.length()) {
+            char cmdChar = serialBuffer.charAt(spaceIdx + 1);
+            
+            ImuControlPacket pkt;
+            pkt.msgType = 1;      
+            pkt.charData = cmdChar;
+            
+            esp_now_send(IMU_MAC, (uint8_t*)&pkt, sizeof(pkt));
+          }
+        }
+        
         serialBuffer = ""; // Reset Buffer
       }
     } else {
-      // Accumulate chars
+      // Accumulate
       if (serialBuffer.length() < 64) {
         serialBuffer += c;
       }
     }
   }
-  
-  // No delay() here. Run as fast as possible.
 }
